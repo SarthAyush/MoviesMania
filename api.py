@@ -576,22 +576,45 @@ async def get_movie_detail(slug: str, subject_id: Optional[str] = None):
         raise e
 
 async def _fetch_stream_from_upstream(subject_id: str, detail_path: str, se: int, ep: int):
-    domain = "https://netfilm.world"
+    global _bearer_token
+    token = await _get_bearer_token()
     player_referer = (
-        f"{domain}/spa/videoPlayPage/movies/{detail_path}"
+        f"https://netfilm.world/spa/videoPlayPage/movies/{detail_path}"
         f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
     )
-    play_url = f"{API_BASE}/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
+    headers = {
+        **PLAYER_HEADERS,
+        "Authorization": f"Bearer {token}" if token else "",
+        "Referer": player_referer
+    }
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=12) as client:
-        try:
-            resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-            return resp.json().get("data", {})
-        except Exception:
-            # Fallback to netfilm.world domain
-            alt_url = f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-            resp = await client.get(alt_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-            return resp.json().get("data", {})
+    urls_to_try = [
+        f"{API_BASE}/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}",
+        f"https://netfilm.world/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}",
+        f"https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}&host=moviebox.ph"
+    ]
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        for play_url in urls_to_try:
+            try:
+                resp = await client.get(play_url, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    if data.get("streams") or data.get("hasResource") or data.get("vipLocked"):
+                        return data
+                elif resp.status_code in [401, 403]:
+                    _bearer_token = None
+                    token = await _get_bearer_token()
+                    headers["Authorization"] = f"Bearer {token}" if token else ""
+                    retry_resp = await client.get(play_url, headers=headers)
+                    if retry_resp.status_code == 200:
+                        data = retry_resp.json().get("data", {})
+                        if data.get("streams") or data.get("hasResource"):
+                            return data
+            except Exception:
+                continue
+
+    return {}
 
 @app.get("/api/stream/{subject_id}")
 async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
@@ -604,15 +627,30 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
     effective_se = se
     effective_ep = ep
 
-    # If nothing found, try fallback (if 0,0 try 1,1; if 1,1 try 0,0)
+    # If nothing found, try fallback strategies:
     if not data.get("hasResource") and not data.get("streams"):
-        fallback_se = 1 if se == 0 else 0
-        fallback_ep = 1 if ep == 0 else 0
-        fallback_data = await _fetch_stream_from_upstream(subject_id, detail_path, fallback_se, fallback_ep)
-        if fallback_data.get("hasResource") or fallback_data.get("streams"):
-            data = fallback_data
-            effective_se = fallback_se
-            effective_ep = fallback_ep
+        fallbacks_to_test = [
+            (1 if se == 0 else 0, 1 if ep == 0 else 0)
+        ]
+        
+        # Check actual seasons from detail if still not found (e.g. shows starting at Season 14)
+        try:
+            det_data = await get_movie_detail(detail_path, subject_id)
+            seasons = det_data.get("data", {}).get("resource", {}).get("seasons", [])
+            for s in seasons:
+                s_se = s.get("se", 0)
+                if s_se != se and s_se != fallbacks_to_test[0][0]:
+                    fallbacks_to_test.append((s_se, 1))
+        except Exception:
+            pass
+
+        for fb_se, fb_ep in fallbacks_to_test:
+            fallback_data = await _fetch_stream_from_upstream(subject_id, detail_path, fb_se, fb_ep)
+            if fallback_data.get("hasResource") or fallback_data.get("streams"):
+                data = fallback_data
+                effective_se = fb_se
+                effective_ep = fb_ep
+                break
 
     has_resource = data.get("hasResource", False)
     raw_streams = data.get("streams", [])

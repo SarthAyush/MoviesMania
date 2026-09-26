@@ -1,4 +1,4 @@
-const BASE = "";
+const BASE = import.meta.env.VITE_API_URL || "";
 
 // High-speed client-side in-memory cache
 const memoryCache = new Map();
