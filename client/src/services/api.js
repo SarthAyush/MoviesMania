@@ -76,12 +76,24 @@ export async function fetchMovieDetail(slug, subjectId = null) {
   return data;
 }
 
+export function resolveMediaUrl(proxyUrl, directUrl) {
+  if (proxyUrl) {
+    if (proxyUrl.startsWith("http://") || proxyUrl.startsWith("https://")) {
+      return proxyUrl;
+    }
+    return `${BASE}${proxyUrl}`;
+  }
+  return directUrl || "";
+}
+
 export async function fetchStreamSources(subjectId, detailPath, se = 0, ep = 0) {
-  const cacheKey = `stream_${subjectId}_${detailPath}_${se}_${ep}`;
+  const safeDetail = detailPath || "";
+  const cacheKey = `stream_${subjectId}_${safeDetail}_${se}_${ep}`;
   const cached = getCached(cacheKey);
   if (cached) return cached;
 
-  const res = await fetch(`${BASE}/api/stream/${subjectId}?detail_path=${detailPath}&se=${se}&ep=${ep}`);
+  const url = `${BASE}/api/stream/${encodeURIComponent(subjectId)}?detail_path=${encodeURIComponent(safeDetail)}&se=${se}&ep=${ep}`;
+  const res = await fetch(url);
   if (!res.ok) throw new Error("Failed to fetch stream sources");
   const data = await res.json();
   if (data.has_resource) {
@@ -91,7 +103,9 @@ export async function fetchStreamSources(subjectId, detailPath, se = 0, ep = 0) 
 }
 
 export async function fetchCaptions(subjectId, detailPath, se = 0, ep = 0) {
-  const res = await fetch(`${BASE}/api/stream/${subjectId}/captions?detail_path=${detailPath}&se=${se}&ep=${ep}`);
+  const safeDetail = detailPath || "";
+  const url = `${BASE}/api/stream/${encodeURIComponent(subjectId)}/captions?detail_path=${encodeURIComponent(safeDetail)}&se=${se}&ep=${ep}`;
+  const res = await fetch(url);
   if (!res.ok) return { captions: [] };
   return res.json();
 }
@@ -101,3 +115,4 @@ export async function fetchRandomTitle() {
   if (!res.ok) throw new Error("Failed to fetch random title");
   return res.json();
 }
+

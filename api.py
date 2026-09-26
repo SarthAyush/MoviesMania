@@ -5,6 +5,7 @@ import time
 import urllib.parse
 import httpx
 import asyncio
+import logging
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -12,6 +13,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from typing import Optional
 import random
+
+logger = logging.getLogger("moviesbox")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="CineBox Streaming Engine",
@@ -179,18 +183,33 @@ def get_stream_client() -> httpx.AsyncClient:
         _stream_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
     return _stream_client
 
+def extract_proxy_target_url(request: Request, raw_url_param: str) -> str:
+    target = raw_url_param
+    if "%3A" in target or "%2F" in target:
+        target = urllib.parse.unquote(target)
+    
+    parsed = urllib.parse.urlparse(target)
+    extra_params = {k: v for k, v in request.query_params.items() if k != "url"}
+    if extra_params:
+        existing_query = urllib.parse.parse_qs(parsed.query)
+        for k, v in extra_params.items():
+            if k not in existing_query:
+                separator = "&" if parsed.query else "?"
+                target = f"{target}{separator}{k}={urllib.parse.quote(v)}"
+                parsed = urllib.parse.urlparse(target)
+    return target
+
 @app.get("/api/proxy/stream")
 async def proxy_video(request: Request, url: str = Query(...)):
-    """Optimized persistent-connection streaming proxy with Range support and 512KB buffer."""
+    """Optimized persistent-connection streaming proxy with Range support, dual referer, and 256KB buffer."""
     try:
-        decoded_url = urllib.parse.unquote(url)
-        parsed = urllib.parse.urlparse(decoded_url)
+        target_url = extract_proxy_target_url(request, url)
         
         req_headers = {
-            **PLAYER_HEADERS,
+            "User-Agent": PLAYER_HEADERS["User-Agent"],
             "Referer": "https://netfilm.world/",
             "Origin": "https://netfilm.world",
-            "Host": parsed.netloc,
+            "Accept": "*/*",
         }
         
         range_header = request.headers.get("range")
@@ -198,16 +217,26 @@ async def proxy_video(request: Request, url: str = Query(...)):
             req_headers["Range"] = range_header
 
         client = get_stream_client()
-        req = client.build_request("GET", decoded_url, headers=req_headers)
+        req = client.build_request("GET", target_url, headers=req_headers)
         upstream_resp = await client.send(req, stream=True)
+
+        # If 401/403/429 with netfilm.world, retry with moviebox.ph referer
+        if upstream_resp.status_code in [401, 403, 429]:
+            await upstream_resp.aclose()
+            req_headers["Referer"] = "https://moviebox.ph/"
+            req_headers["Origin"] = "https://moviebox.ph"
+            req = client.build_request("GET", target_url, headers=req_headers)
+            upstream_resp = await client.send(req, stream=True)
 
         async def stream_generator():
             try:
-                # 512 KB chunk size for ultra-smooth video buffering
-                async for chunk in upstream_resp.aiter_bytes(chunk_size=1024 * 512):
+                # 256 KB chunk size for ultra-responsive video buffering
+                async for chunk in upstream_resp.aiter_bytes(chunk_size=1024 * 256):
                     yield chunk
             except (asyncio.CancelledError, GeneratorExit):
                 pass
+            except Exception as exc:
+                logger.debug(f"Client disconnected during streaming: {exc}")
             finally:
                 await upstream_resp.aclose()
 
@@ -215,7 +244,9 @@ async def proxy_video(request: Request, url: str = Query(...)):
             "Accept-Ranges": "bytes",
             "Content-Type": upstream_resp.headers.get("content-type", "video/mp4"),
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
             "Cache-Control": "public, max-age=3600",
         }
 
@@ -616,56 +647,133 @@ async def _fetch_stream_from_upstream(subject_id: str, detail_path: str, se: int
 
     return {}
 
+def extract_valid_streams(data: dict) -> list[dict]:
+    valid = []
+    for s in (data.get("streams", []) or []):
+        raw_url = s.get("url", "")
+        if raw_url and raw_url.startswith("http"):
+            valid.append(s)
+    return valid
+
 @app.get("/api/stream/{subject_id}")
-async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
-    cache_key = f"stream_{subject_id}_{detail_path}_{se}_{ep}"
+async def get_stream_sources(subject_id: str, detail_path: Optional[str] = "", se: int = 0, ep: int = 0):
+    effective_detail_path = (detail_path or "").strip()
+    if not effective_detail_path or effective_detail_path in ["null", "undefined"]:
+        try:
+            det = await get_movie_detail(subject_id, subject_id)
+            sub = det.get("data", {}).get("subject", {})
+            effective_detail_path = sub.get("detailPath") or subject_id
+        except Exception:
+            effective_detail_path = subject_id
+
+    cache_key = f"stream_{subject_id}_{effective_detail_path}_{se}_{ep}"
     cached = get_from_cache(cache_key)
     if cached:
         return cached
 
-    data = await _fetch_stream_from_upstream(subject_id, detail_path, se, ep)
+    # 1. Primary upstream fetch
+    data = await _fetch_stream_from_upstream(subject_id, effective_detail_path, se, ep)
+    valid_raw_streams = extract_valid_streams(data)
     effective_se = se
     effective_ep = ep
+    effective_sid = subject_id
+    effective_slug = effective_detail_path
+    stream_note = None
+    det_data = None
 
-    # If nothing found, try fallback strategies:
-    if not data.get("hasResource") and not data.get("streams"):
-        fallbacks_to_test = [
-            (1 if se == 0 else 0, 1 if ep == 0 else 0)
-        ]
-        
-        # Check actual seasons from detail if still not found (e.g. shows starting at Season 14)
+    # 2. Season / Episode Fallback if primary returned no playable stream
+    if not valid_raw_streams:
+        se_ep_candidates = []
+        if se == 0 and ep == 0:
+            se_ep_candidates.append((1, 1))
+        elif se == 1 and ep == 1:
+            se_ep_candidates.append((0, 0))
+
         try:
-            det_data = await get_movie_detail(detail_path, subject_id)
+            det_data = await get_movie_detail(effective_detail_path, subject_id)
             seasons = det_data.get("data", {}).get("resource", {}).get("seasons", [])
             for s in seasons:
                 s_se = s.get("se", 0)
-                if s_se != se and s_se != fallbacks_to_test[0][0]:
-                    fallbacks_to_test.append((s_se, 1))
+                if (s_se, 1) not in se_ep_candidates:
+                    se_ep_candidates.append((s_se, 1))
         except Exception:
             pass
 
-        for fb_se, fb_ep in fallbacks_to_test:
-            fallback_data = await _fetch_stream_from_upstream(subject_id, detail_path, fb_se, fb_ep)
-            if fallback_data.get("hasResource") or fallback_data.get("streams"):
-                data = fallback_data
+        for fb_se, fb_ep in se_ep_candidates:
+            fb_data = await _fetch_stream_from_upstream(subject_id, effective_detail_path, fb_se, fb_ep)
+            fb_valid = extract_valid_streams(fb_data)
+            if fb_valid:
+                data = fb_data
+                valid_raw_streams = fb_valid
                 effective_se = fb_se
                 effective_ep = fb_ep
                 break
 
-    has_resource = data.get("hasResource", False)
-    raw_streams = data.get("streams", [])
-    if raw_streams and not has_resource:
-        has_resource = True
+    # 3. Dubs & Language Fallback (e.g. Inception, Regional Dubs)
+    if not valid_raw_streams:
+        if not det_data:
+            try:
+                det_data = await get_movie_detail(effective_detail_path, subject_id)
+            except Exception:
+                det_data = {}
+
+        dubs = det_data.get("data", {}).get("subject", {}).get("dubs", []) or []
+        for dub in dubs:
+            d_sid = dub.get("subjectId")
+            d_slug = dub.get("detailPath")
+            d_name = dub.get("lanName") or dub.get("lanCode") or "Alternate Audio"
+            if d_sid and d_slug and str(d_sid) != str(subject_id):
+                dub_data = await _fetch_stream_from_upstream(d_sid, d_slug, effective_se, effective_ep)
+                dub_valid = extract_valid_streams(dub_data)
+                if not dub_valid and (effective_se != 0 or effective_ep != 0):
+                    dub_data = await _fetch_stream_from_upstream(d_sid, d_slug, 0, 0)
+                    dub_valid = extract_valid_streams(dub_data)
+                if dub_valid:
+                    data = dub_data
+                    valid_raw_streams = dub_valid
+                    effective_sid = d_sid
+                    effective_slug = d_slug
+                    stream_note = f"Playing {d_name} (Auto-Switched Source)"
+                    break
+
+    # 4. Sibling Search Fallback (by clean title e.g. Oppenheimer Hindi -> Oppenheimer original)
+    if not valid_raw_streams:
+        raw_title = det_data.get("data", {}).get("subject", {}).get("title") if det_data else ""
+        if not raw_title:
+            raw_title = effective_detail_path.split("-")[0]
+        clean_title = re.sub(r"\[.*?\]|\(.*?\)|S\d+.*", "", raw_title).strip()
+        if clean_title and len(clean_title) >= 3:
+            try:
+                search_res = await search(clean_title)
+                for item in search_res.get("items", []):
+                    i_sid = item.get("subject_id")
+                    i_slug = item.get("slug")
+                    if i_sid and i_slug and str(i_sid) != str(subject_id):
+                        sib_data = await _fetch_stream_from_upstream(i_sid, i_slug, effective_se, effective_ep)
+                        sib_valid = extract_valid_streams(sib_data)
+                        if not sib_valid and (effective_se != 0 or effective_ep != 0):
+                            sib_data = await _fetch_stream_from_upstream(i_sid, i_slug, 0, 0)
+                            sib_valid = extract_valid_streams(sib_data)
+                        if sib_valid:
+                            data = sib_data
+                            valid_raw_streams = sib_valid
+                            effective_sid = i_sid
+                            effective_slug = i_slug
+                            stream_note = f"Playing {item.get('name')} (Free Stream)"
+                            break
+            except Exception:
+                pass
 
     streams = []
-    for s in raw_streams:
+    for s in valid_raw_streams:
         raw_url = s.get("url", "")
         if not raw_url:
             continue
-        proxy_url = f"/api/proxy/stream?url={urllib.parse.quote(raw_url)}"
+        proxy_url = f"/api/proxy/stream?url={urllib.parse.quote(raw_url, safe='')}"
+        res_label = f"{s.get('resolutions')}p" if s.get('resolutions') else "HD"
         streams.append({
-            "resolution": f"{s.get('resolutions')}p",
-            "format": s.get("format"),
+            "resolution": res_label,
+            "format": s.get("format", "MP4"),
             "url": raw_url,
             "proxy_url": proxy_url,
             "size": s.get("size"),
@@ -674,15 +782,16 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
         })
 
     has_playable = len(streams) > 0
-    note_msg = None
+    note_msg = stream_note
     if not has_playable:
         if data.get("vipLocked"):
-            note_msg = "This title is VIP-locked on MovieBox and requires a paid account for playback."
+            note_msg = "This title is VIP-locked upstream with no alternative free streams available."
         else:
             note_msg = "No playable free stream available for this selection."
 
     res = {
-        "subject_id": subject_id,
+        "subject_id": effective_sid,
+        "detail_path": effective_slug,
         "se": effective_se,
         "ep": effective_ep,
         "has_resource": has_playable,
@@ -691,7 +800,7 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
         "dash": data.get("dash", []),
         "free_episodes": data.get("freeNum"),
         "limited": data.get("limited", False),
-        "vip_locked": data.get("vipLocked", False),
+        "vip_locked": data.get("vipLocked", False) and not has_playable,
         "note": note_msg
     }
     if has_playable:
@@ -699,17 +808,26 @@ async def get_stream_sources(subject_id: str, detail_path: str, se: int = 0, ep:
     return res
 
 @app.get("/api/stream/{subject_id}/captions")
-async def get_captions(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
-    cache_key = f"caps_{subject_id}_{detail_path}_{se}_{ep}"
+async def get_captions(subject_id: str, detail_path: Optional[str] = "", se: int = 0, ep: int = 0):
+    effective_detail_path = (detail_path or "").strip()
+    if not effective_detail_path or effective_detail_path in ["null", "undefined"]:
+        try:
+            det = await get_movie_detail(subject_id, subject_id)
+            sub = det.get("data", {}).get("subject", {})
+            effective_detail_path = sub.get("detailPath") or subject_id
+        except Exception:
+            effective_detail_path = subject_id
+
+    cache_key = f"caps_{subject_id}_{effective_detail_path}_{se}_{ep}"
     cached = get_from_cache(cache_key)
     if cached:
         return cached
 
-    data = await _fetch_stream_from_upstream(subject_id, detail_path, se, ep)
+    data = await _fetch_stream_from_upstream(subject_id, effective_detail_path, se, ep)
     if not data.get("hasResource") and not data.get("streams"):
         fallback_se = 1 if se == 0 else 0
         fallback_ep = 1 if ep == 0 else 0
-        fb_data = await _fetch_stream_from_upstream(subject_id, detail_path, fallback_se, fallback_ep)
+        fb_data = await _fetch_stream_from_upstream(subject_id, effective_detail_path, fallback_se, fallback_ep)
         if fb_data.get("hasResource") or fb_data.get("streams"):
             data = fb_data
             se = fallback_se
@@ -732,7 +850,7 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 0, ep: int =
 
     cap_url = (
         f"{API_BASE}/subject/caption"
-        f"?format={stream_format}&id={stream_id}&subjectId={subject_id}&detailPath={detail_path}"
+        f"?format={stream_format}&id={stream_id}&subjectId={subject_id}&detailPath={effective_detail_path}"
     )
     cap_data = await _make_request(cap_url)
     inner = cap_data.get("data", {})
@@ -746,11 +864,13 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 0, ep: int =
             "language": c.get("lan"),
             "label": c.get("lanName") or c.get("lan", "Subtitle"),
             "url": raw_cap_url,
-            "vtt_proxy_url": f"/api/proxy/subtitle?url={urllib.parse.quote(raw_cap_url)}" if raw_cap_url else None
+            "vtt_proxy_url": f"/api/proxy/subtitle?url={urllib.parse.quote(raw_cap_url, safe='')}" if raw_cap_url else None
         })
 
     result = {"subject_id": subject_id, "se": se, "ep": ep, "count": len(formatted_captions), "captions": formatted_captions}
     set_in_cache(cache_key, result)
+    return result
+
 @app.get("/api/random")
 async def get_random_title():
     """Returns a random featured title from home catalog for 'Surprise Me'."""

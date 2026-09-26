@@ -5,8 +5,9 @@ import {
   SkipForward, AlertCircle, Check, ListFilter, Languages, RefreshCw,
   Sliders, Gauge, HelpCircle
 } from "lucide-react";
-import { fetchStreamSources, fetchCaptions, fetchMovieDetail } from "../services/api";
+import { fetchStreamSources, fetchCaptions, fetchMovieDetail, resolveMediaUrl } from "../services/api";
 import { parseSeriesData, isTvSeries } from "../services/seriesHelper";
+
 
 export default function VideoPlayer({
   movie,
@@ -186,11 +187,14 @@ export default function VideoPlayer({
 
         if (isMounted) {
           setSources(availableSources);
-          // Pick best quality (1080p, else first)
-          const primary = availableSources.find((s) => s.resolution === "1080p") || availableSources[0];
+          // Pick best quality (1080p, else 720p, else first)
+          const primary = availableSources.find((s) => s.resolution === "1080p") 
+                       || availableSources.find((s) => s.resolution === "720p") 
+                       || availableSources[0];
           setCurrentQuality(primary.resolution);
-          setCurrentStreamUrl(primary.proxy_url || primary.url);
+          setCurrentStreamUrl(resolveMediaUrl(primary.proxy_url, primary.url));
         }
+
 
         // Fetch captions
         try {
@@ -480,8 +484,9 @@ export default function VideoPlayer({
     wasPlayingRef.current = !videoRef.current.paused;
 
     setCurrentQuality(res);
-    setCurrentStreamUrl(target.proxy_url || target.url);
+    setCurrentStreamUrl(resolveMediaUrl(target.proxy_url, target.url));
     setShowQualityMenu(false);
+
   };
 
   // Audio Dub switch (PRESERVES EXACT PLAYBACK TIME)
@@ -683,7 +688,6 @@ export default function VideoPlayer({
           playsInline
           autoPlay
           preload="auto"
-          crossOrigin="anonymous"
           onClick={togglePlay}
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
@@ -695,13 +699,35 @@ export default function VideoPlayer({
           onError={() => {
             setBuffering(false);
             setLoading(false);
-            const curSource = sources.find((s) => (s.proxy_url === currentStreamUrl || s.url === currentStreamUrl));
-            if (curSource && currentStreamUrl === curSource.proxy_url && curSource.url) {
-              console.warn("Proxy stream failed, attempting direct CDN fallback...");
-              setCurrentStreamUrl(curSource.url);
-            } else {
-              setError("Playback failed. The upstream media CDN may be temporarily slow or geo-restricted. Try changing resolution or episode.");
+            const curSource = sources.find((s) => {
+              const fullProxy = resolveMediaUrl(s.proxy_url);
+              return fullProxy === currentStreamUrl || s.url === currentStreamUrl || s.proxy_url === currentStreamUrl;
+            });
+
+            if (curSource) {
+              const fullProxy = resolveMediaUrl(curSource.proxy_url);
+              // 1. If proxied stream failed, try direct CDN URL
+              if (currentStreamUrl === fullProxy && curSource.url && curSource.url !== currentStreamUrl) {
+                console.warn("Proxy stream failed, attempting direct CDN stream...");
+                setCurrentStreamUrl(curSource.url);
+                return;
+              }
+
+              // 2. If direct CDN failed or no direct URL, try next available quality source
+              const nextSource = sources.find((s) => {
+                const fullProxyNext = resolveMediaUrl(s.proxy_url);
+                return s !== curSource && (fullProxyNext || s.url);
+              });
+
+              if (nextSource) {
+                console.warn(`Quality ${curSource.resolution} failed, switching to ${nextSource.resolution}...`);
+                setCurrentQuality(nextSource.resolution);
+                setCurrentStreamUrl(resolveMediaUrl(nextSource.proxy_url, nextSource.url));
+                return;
+              }
             }
+
+            setError("Playback failed. The upstream media CDN may be temporarily slow or geo-restricted. Try changing resolution or episode.");
           }}
           className="w-full h-full object-contain cursor-pointer"
         >
@@ -712,11 +738,12 @@ export default function VideoPlayer({
               kind="subtitles"
               label={cap.label}
               srcLang={cap.language || "en"}
-              src={cap.vtt_proxy_url || cap.url}
+              src={resolveMediaUrl(cap.vtt_proxy_url, cap.url)}
               default={selectedCaption === String(cap.id)}
             />
           ))}
         </video>
+
       )}
 
       {/* Floating In-App Mini-Player Overlay */}
