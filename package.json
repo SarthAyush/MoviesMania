@@ -1,0 +1,13 @@
+{
+  "name": "cinebox-moviebox-streaming",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "CineBox - Modern Full-Stack Web Streaming App",
+  "scripts": {
+    "dev": "node dev.js",
+    "start": "node dev.js",
+    "backend": ".\\.venv\\Scripts\\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000 --reload",
+    "frontend": "npm run dev --prefix client",
+    "build": "npm run build --prefix client"
+  }
+}

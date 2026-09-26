@@ -1,0 +1,164 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --theme-primary: #e11d48;
+  --theme-hover: #f43f5e;
+  --theme-glow: rgba(225, 29, 72, 0.35);
+  --theme-border: rgba(225, 29, 72, 0.45);
+  --theme-badge: #e11d48;
+}
+
+[data-theme="cyan"] {
+  --theme-primary: #06b6d4;
+  --theme-hover: #22d3ee;
+  --theme-glow: rgba(6, 182, 212, 0.35);
+  --theme-border: rgba(6, 182, 212, 0.45);
+  --theme-badge: #06b6d4;
+}
+
+[data-theme="violet"] {
+  --theme-primary: #8b5cf6;
+  --theme-hover: #a78bfa;
+  --theme-glow: rgba(139, 92, 246, 0.35);
+  --theme-border: rgba(139, 92, 246, 0.45);
+  --theme-badge: #8b5cf6;
+}
+
+[data-theme="emerald"] {
+  --theme-primary: #10b981;
+  --theme-hover: #34d399;
+  --theme-glow: rgba(16, 185, 129, 0.35);
+  --theme-border: rgba(16, 185, 129, 0.45);
+  --theme-badge: #10b981;
+}
+
+[data-theme="amber"] {
+  --theme-primary: #f59e0b;
+  --theme-hover: #fbbf24;
+  --theme-glow: rgba(245, 158, 11, 0.35);
+  --theme-border: rgba(245, 158, 11, 0.45);
+  --theme-badge: #f59e0b;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #07090e;
+  color: #f1f5f9;
+  font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Custom modern sleek scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #07090e;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e2433;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--theme-primary);
+}
+
+/* Theme utility classes */
+.btn-theme {
+  background-color: var(--theme-primary);
+  color: #ffffff;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.btn-theme:hover {
+  background-color: var(--theme-hover);
+  box-shadow: 0 8px 20px -4px var(--theme-glow);
+}
+
+.text-theme {
+  color: var(--theme-primary);
+}
+
+.border-theme {
+  border-color: var(--theme-border);
+}
+
+.bg-theme-glow {
+  box-shadow: 0 0 25px -4px var(--theme-glow);
+}
+
+/* ISOLATED TILE HOVER ANIMATION: Only the hovered tile animates, zero sibling jitter */
+.movie-tile {
+  transform: translateZ(0);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.25s ease;
+  will-change: transform;
+  transform-origin: center;
+}
+
+.movie-tile:hover {
+  transform: scale(1.04) translateZ(0);
+  box-shadow: 0 16px 36px -8px var(--theme-glow), 0 0 0 1px var(--theme-border);
+}
+
+/* Uniform card media frame */
+.poster-frame {
+  position: relative;
+  aspect-ratio: 2/3;
+  width: 100%;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  background-color: #12151e;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+/* Hide scrollbar for carousel sliders */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Ambient backdrop gradient */
+.ambient-glow {
+  background: radial-gradient(circle at 50% 0%, var(--theme-glow) 0%, transparent 60%);
+  pointer-events: none;
+  transition: background 0.8s ease-in-out;
+}
+
+/* Shimmer Skeleton Animation for zero-CLS loading */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.03) 25%,
+    rgba(255, 255, 255, 0.08) 37%,
+    rgba(255, 255, 255, 0.03) 63%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.8s ease-in-out infinite;
+}
+
+/* Floating Mini-Player Transition */
+.mini-player-dock {
+  box-shadow: 0 20px 45px -10px rgba(0, 0, 0, 0.85), 0 0 25px -5px var(--theme-glow);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s ease;
+}
+.mini-player-dock:hover {
+  transform: translateY(-3px) scale(1.01);
+  box-shadow: 0 24px 50px -8px rgba(0, 0, 0, 0.95), 0 0 30px -4px var(--theme-glow);
+}
